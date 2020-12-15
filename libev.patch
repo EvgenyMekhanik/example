@@ -1,0 +1,185 @@
+diff --git a/ev.c b/ev.c
+index ec212a1..b51739e 100644
+--- a/ev.c
++++ b/ev.c
+@@ -2728,46 +2728,53 @@ static ANSIG signals [EV_NSIG - 1];
+ 
+ #if EV_SIGNAL_ENABLE || EV_ASYNC_ENABLE
+ 
+-ecb_noinline ecb_cold
+-static void
+-evpipe_init (EV_P)
++static int
++evpipe_alloc(EV_P)
+ {
+-  if (!ev_is_active (&pipe_w))
+-    {
+-      int fds [2];
++  int fds [2];
+ 
+ # if EV_USE_EVENTFD
+-      fds [0] = -1;
+-      fds [1] = eventfd (0, EFD_NONBLOCK | EFD_CLOEXEC);
+-      if (fds [1] < 0 && errno == EINVAL)
+-        fds [1] = eventfd (0, 0);
++  fds [0] = -1;
++  fds [1] = eventfd (0, EFD_NONBLOCK | EFD_CLOEXEC);
++  if (fds [1] < 0 && errno == EINVAL)
++    fds [1] = eventfd (0, 0);
+ 
+-      if (fds [1] < 0)
++  if (fds [1] < 0)
+ # endif
+-        {
+-          while (pipe (fds))
+-            ev_syserr ("(libev) error creating signal/async pipe");
++    {
++      if (pipe(fds))
++        return -1;
++      fd_intern (fds [0]);
++    }
+ 
+-          fd_intern (fds [0]);
+-        }
++  evpipe [0] = fds [0];
+ 
+-      evpipe [0] = fds [0];
++  if (evpipe [1] < 0)
++    evpipe [1] = fds [1]; /* first call, set write fd */
++  else
++    {
++      /* on subsequent calls, do not change evpipe [1] */
++      /* so that evpipe_write can always rely on its value. */
++      /* this branch does not do anything sensible on windows, */
++      /* so must not be executed on windows */
+ 
+-      if (evpipe [1] < 0)
+-        evpipe [1] = fds [1]; /* first call, set write fd */
+-      else
+-        {
+-          /* on subsequent calls, do not change evpipe [1] */
+-          /* so that evpipe_write can always rely on its value. */
+-          /* this branch does not do anything sensible on windows, */
+-          /* so must not be executed on windows */
++      dup2 (fds [1], evpipe [1]);
++      close (fds [1]);
++    }
+ 
+-          dup2 (fds [1], evpipe [1]);
+-          close (fds [1]);
+-        }
++  fd_intern (evpipe [1]);
++  return 1;
++}
+ 
+-      fd_intern (evpipe [1]);
++ecb_noinline ecb_cold
++static void
++evpipe_init (EV_P)
++{
++  if (!ev_is_active (&pipe_w))
++    {
+ 
++      while (evpipe_alloc(loop) == -1)
++        ev_syserr("(libev) error creating signal/async pipe");
+       ev_io_set (&pipe_w, evpipe [0] < 0 ? evpipe [1] : evpipe [0], EV_READ);
+       ev_io_start (EV_A_ &pipe_w);
+       ev_unref (EV_A); /* watcher should not keep loop alive */
+@@ -3307,6 +3314,7 @@ loop_init (EV_P_ unsigned int flags) EV_NOEXCEPT
+       pipe_write_wanted  = 0;
+       evpipe [0]         = -1;
+       evpipe [1]         = -1;
++      pipe_w.fd          = -1;
+ #if EV_USE_INOTIFY
+       fs_fd              = flags & EVFLAG_NOINOTIFY ? -1 : -2;
+ #endif
+@@ -3320,6 +3328,10 @@ loop_init (EV_P_ unsigned int flags) EV_NOEXCEPT
+       if (!(flags & EVBACKEND_MASK))
+         flags |= ev_recommended_backends ();
+ 
++      if (flags & EVFLAG_ALLOCFD)
++        if (evpipe_alloc(EV_A) < 0)
++          return;
++
+ #if EV_USE_IOCP
+       if (!backend && (flags & EVBACKEND_IOCP    )) backend = iocp_init      (EV_A_ flags);
+ #endif
+@@ -3350,6 +3362,12 @@ loop_init (EV_P_ unsigned int flags) EV_NOEXCEPT
+ #if EV_SIGNAL_ENABLE || EV_ASYNC_ENABLE
+       ev_init (&pipe_w, pipecb);
+       ev_set_priority (&pipe_w, EV_MAXPRI);
++      if (flags & EVFLAG_ALLOCFD)
++        {
++          ev_io_set (&pipe_w, evpipe [0] < 0 ? evpipe [1] : evpipe [0], EV_READ);
++          ev_io_start (EV_A_ &pipe_w);
++          ev_unref (EV_A);
++        }
+ #endif
+     }
+ }
+@@ -4470,6 +4488,38 @@ ev_timer_remaining (EV_P_ ev_timer *w) EV_NOEXCEPT
+   return ev_at (w) - (ev_is_active (w) ? mn_now : EV_TS_CONST (0.));
+ }
+ 
++int
++ev_get_pipew(EV_P)
++{
++  return pipe_w.fd;
++}
++
++int
++ev_prepare_extern_loop_wait(EV_P)
++{
++  fd_reify (EV_A);
++  pipe_write_wanted = 1;
++  ECB_MEMORY_FENCE;
++  if (ecb_expect_true (!pipe_write_skipped))
++    return 1;
++  return 0;
++}
++
++void
++ev_process_events(EV_P_ int fd, int revents)
++{
++  if(revents)
++    fd_event (EV_A_ fd, revents);
++  pipe_write_wanted = 0; /* just an optimisation, no fence needed */
++  ECB_MEMORY_FENCE_ACQUIRE;
++  if (pipe_write_skipped)
++    {
++      assert (("libev: pipe_w not active, but pipe not written", ev_is_active (&pipe_w)));
++      ev_feed_event (EV_A_ &pipe_w, EV_CUSTOM);
++    }
++  EV_INVOKE_PENDING;
++}
++
+ #if EV_PERIODIC_ENABLE
+ ecb_noinline
+ void
+diff --git a/ev.h b/ev.h
+index 4669c39..3f6fd36 100644
+--- a/ev.h
++++ b/ev.h
+@@ -511,7 +511,8 @@ enum {
+ #endif
+   EVFLAG_SIGNALFD   = 0x00200000U, /* attempt to use signalfd */
+   EVFLAG_NOSIGMASK  = 0x00400000U, /* avoid modifying the signal mask */
+-  EVFLAG_NOTIMERFD  = 0x00800000U  /* avoid creating a timerfd */
++  EVFLAG_NOTIMERFD  = 0x00800000U, /* avoid creating a timerfd */
++  EVFLAG_ALLOCFD    = 0x01000000U  /* preallocate event pipe descriptors */
+ };
+ 
+ /* method bits to be ored together */
+@@ -768,6 +769,12 @@ EV_API_DECL void ev_timer_stop     (EV_P_ ev_timer *w) EV_NOEXCEPT;
+ EV_API_DECL void ev_timer_again    (EV_P_ ev_timer *w) EV_NOEXCEPT;
+ /* return remaining time */
+ EV_API_DECL ev_tstamp ev_timer_remaining (EV_P_ ev_timer *w) EV_NOEXCEPT;
++/* get pipe_w file descriptor */
++EV_API_DECL int ev_get_pipew(EV_P) EV_NOEXCEPT;
++/* prepare liveb fds to external loop */
++EV_API_DECL int ev_prepare_extern_loop_wait(EV_P);
++/* process events getting in other loop */
++EV_API_DECL void ev_process_events(EV_P_ int fd, int revents);
+ 
+ #if EV_PERIODIC_ENABLE
+ EV_API_DECL void ev_periodic_start (EV_P_ ev_periodic *w) EV_NOEXCEPT;
